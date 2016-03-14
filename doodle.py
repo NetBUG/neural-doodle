@@ -12,7 +12,7 @@ import bz2
 import pickle
 import argparse
 import warnings
-
+from theano.compile.nanguardmode import NanGuardMode
 
 # Configure all options first so we can custom load other libraries (Theano) based on device specified by user.
 parser = argparse.ArgumentParser(description='Generate a new image by applying style onto a content image.',
@@ -265,7 +265,7 @@ class NeuralGenerator(object):
         # Compile a function to run on the GPU to extract patches for all layers at once.
         extractor = theano.function(
                         [self.model.tensor_img, self.model.tensor_map],
-                        self.extract_patches([self.model.tensor_outputs['sem'+l] for l in self.style_layers]))
+                        self.extract_patches([self.model.tensor_outputs['sem'+l] for l in self.style_layers]), mode=NanGuardMode(nan_is_error=True, inf_is_error=True, big_is_error=False))
         result = extractor(self.style_image, self.style_map)
 
         # For each layer, we now have a set of patches and their magnitude.
@@ -377,7 +377,7 @@ class NeuralGenerator(object):
     def evaluate(self, Xn):
         """Callback for the L-BFGS optimization that computes the loss and gradients on the GPU.
         """
-        
+        assert not np.isnan(Xn).any()
         # Adjust the representation to be compatible with the model before computing results.
         current_img = Xn.reshape(self.content_image.shape).astype(np.float32) - self.model.pixel_mean
         grads, *losses = self.compute_grad_and_losses(current_img, self.content_map)
@@ -412,6 +412,7 @@ class NeuralGenerator(object):
 
         # Return the data in the right format for L-BFGS.
         self.frame += 1
+        assert not np.isnan(grads).any()
         return loss, np.array(grads).flatten().astype(np.float64)
 
     def run(self):
