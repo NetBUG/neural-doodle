@@ -33,6 +33,7 @@ add_arg('--smoothness',     default=1E+0, type=float,       help='Weight of imag
 add_arg('--seed',           default='noise', type=str,      help='Seed image path, "noise" or "content".')
 add_arg('--iterations',     default=100, type=int,          help='Number of iterations to run each resolution.')
 add_arg('--device',         default='cpu', type=str,        help='Index of the GPU number to use, for theano.')
+add_arg('--safe-mode',      default=0, action='store_true', help='Use conservative Theano setting to avoid problems.')
 add_arg('--print-every',    default=10, type=int,           help='How often to log statistics to stdout.')
 add_arg('--save-every',     default=0, type=int,            help='How frequently to save PNG into `frames`.')
 args = parser.parse_args()
@@ -58,7 +59,9 @@ print('{}Neural Doodle for semantic style transfer.{}'.format(ansi.CYAN_B, ansi.
 
 # Load the underlying deep learning libraries based on the device specified.  If you specify THEANO_FLAGS manually,
 # the code assumes you know what you are doing and they are not overriden!
-os.environ.setdefault('THEANO_FLAGS', 'device=%s,force_device=True,floatX=float32,print_active_device=False' % (args.device))
+extra_flags = ',optimizer=fast_compile' if args.safe_mode else ''
+os.environ.setdefault('THEANO_FLAGS', 'floatX=float32,device={},force_device=True,'\
+                                      'print_active_device=False{}'.format(args.device, extra_flags))
 
 # Scientific Libraries
 import numpy as np
@@ -72,14 +75,14 @@ import theano.tensor.nnet.neighbours
 
 # Deep Learning Framework
 with warnings.catch_warnings():
-    # suppress: "downsample module has been moved to the pool module."
+    # suppress: "downsample module has been moved to the pool module." (Temporary workaround.)
     warnings.simplefilter("ignore")
     import lasagne
 
 from lasagne.layers import Conv2DLayer as ConvLayer, Pool2DLayer as PoolLayer
 from lasagne.layers import InputLayer, ConcatLayer
 
-print('{}  - Using device `{}` for processing the image.{}'.format(ansi.CYAN, theano.config.device, ansi.ENDC))
+print('{}  - Using device `{}` for processing the images.{}'.format(ansi.CYAN, theano.config.device, ansi.ENDC))
 
 
 #----------------------------------------------------------------------------------------------------------------------
@@ -125,7 +128,7 @@ class Model(object):
         net['map_3'] = PoolLayer(net['map'], 4, mode='average_exc_pad')
         net['map_4'] = PoolLayer(net['map'], 8, mode='average_exc_pad')
 
-        net['sem2_1'] = ConcatLayer([net['conv3_1'], net['map_2']])
+        net['sem2_1'] = ConcatLayer([net['conv2_1'], net['map_2']])
         net['sem3_1'] = ConcatLayer([net['conv3_1'], net['map_3']])
         net['sem4_1'] = ConcatLayer([net['conv4_1'], net['map_4']])
 
@@ -214,8 +217,24 @@ class NeuralGenerator(object):
                   "{}  - Try making sure `{}` exists and is a valid image.{}\n".format(ansi.RED_B, ansi.RED, args.style, ansi.ENDC))
             sys.exit(-1)
 
+        if self.content_map_original is not None and self.style_map_original is None:
+            basename, _ = os.path.splitext(args.style)
+            print("\n{}ERROR: Expecting a semantic map for the input style image too.\n"\
+                  "{}  - Try creating the file `{}_sem.png` with your annotations.{}\n".format(ansi.RED_B, ansi.RED, basename, ansi.ENDC))
+            sys.exit(-1)
+
+        if self.style_map_original is not None and self.content_map_original is None:
+            basename, _ = os.path.splitext(target)
+            print("\n{}ERROR: Expecting a semantic map for the input content image too.\n"\
+                  "{}  - Try creating the file `{}_sem.png` with your annotations.{}\n".format(ansi.RED_B, ansi.RED, basename, ansi.ENDC))
+            sys.exit(-1)
+
         if self.content_map_original is None:
             self.content_map_original = np.zeros(self.content_img_original.shape[:2]+(1,))
+            self.semantic_weight = 0.0
+
+        if self.style_map_original is None:
+            self.style_map_original = np.zeros(self.style_img_original.shape[:2]+(1,))
             self.semantic_weight = 0.0
 
         if self.content_img_original is None:
@@ -224,7 +243,7 @@ class NeuralGenerator(object):
 
         if self.content_map_original.shape[2] != self.style_map_original.shape[2]:
             print("\n{}ERROR: Mismatch in number of channels for style and content semantic map.\n"\
-                  "{}  - Make sure both images are RGB or RGBA.{}\n".format(ansi.RED_B, ansi.RED, args.style, ansi.ENDC))
+                  "{}  - Make sure both images are RGB or RGBA.{}\n".format(ansi.RED_B, ansi.RED, ansi.ENDC))
             sys.exit(-1)
 
     def load_images(self, name, filename):
@@ -237,6 +256,13 @@ class NeuralGenerator(object):
         
         if img is not None: print('  - Loading {} image data from {}.'.format(name, filename))
         if map is not None: print('  - Loading {} semantic map from {}.'.format(name, mapname))
+        
+        if img is not None and map is not None and img.shape[:2] != map.shape[:2]:
+            print("\n{}ERROR: The {} image and its semantic map have different resolutions. Either:\n"\
+                  "{}  - Resize {} to {}, or\n  - Resize {} to {}.\n"\
+                  .format(ansi.RED_B, name, ansi.RED, filename,map.shape[1::-1], mapname,img.shape[1::-1], ansi.ENDC))
+            sys.exit(-1)
+
         return img, map
 
     #------------------------------------------------------------------------------------------------------------------
@@ -356,8 +382,10 @@ class NeuralGenerator(object):
             # Pick the best style patches for each patch in the current image, the result is an array of indices.
             best = dist.argmax(axis=0)
             
-            # Now compute the mean squared error between the current patch and the best matching style patch.
-            loss = T.mean((patches[:,:-3] - layer.W[best,:-3]) ** 2.0)
+            # Compute the mean squared error between the current patch and the best matching style patch.
+            # Ignore the last channels (from semantic map) so errors returned are indicative of image only.
+            channels = self.style_map_original.shape[2]
+            loss = T.mean((patches[:,:-channels] - layer.W[best,:-channels]) ** 2.0)
             style_loss.append(('style', l, args.style_weight * loss))
 
         return style_loss
@@ -383,7 +411,7 @@ class NeuralGenerator(object):
         grads, *losses = self.compute_grad_and_losses(current_img, self.content_map)
         
         if np.isnan(grads).any():
-            raise RuntimeError("Optimization diverged; try using different device or parameters.")
+            raise OverflowError("Optimization diverged; try using different device or parameters.")
 
         # Use gradients as an estimate for overall quality.
         self.error = self.error * 0.9 + 0.1 * np.abs(grads).max()
@@ -463,9 +491,10 @@ class NeuralGenerator(object):
                                 m=4,                             # Maximum correlations kept in memory by algorithm. 
                                 maxfun=args.iterations-1,        # Limit number of calls to evaluate().
                                 iprint=-1)                       # Handle our own logging of information.
-            except RuntimeError:
-                print("{}ERROR: The optimization diverged and NaN numbers were encountered.\n"\
-                      "{}  - Try using a different device or change the parameters.{}\n".format(ansi.RED_B, ansi.RED, ansi.ENDC))
+            except OverflowError:
+                print("{}ERROR: The optimization diverged and NaNs were encountered.{}\n"\
+                      "  - Try using a different `--device` or change the parameters.\n"\
+                      "  - Experiment with `--safe-mode` to work around platform bugs.{}\n".format(ansi.RED_B, ansi.RED, ansi.ENDC))
                 sys.exit(-1)
 
             args.seed = 'previous'
